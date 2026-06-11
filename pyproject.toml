@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mini-coding-agent-ollama"
+version = "0.1.0"
+description = "Minimal standalone coding agent backed by Ollama"
+requires-python = ">=3.10"
+dependencies = [
+    "pytest>=9.0.2",
+    "langgraph>=0.2.0",
+    "langchain-core>=0.3.0",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+mini-coding-agent = "mini_coding_agent:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3.5",
+  "ruff>=0.4.4",
+]
+
+[tool.setuptools]
+packages = ["mini_coding_agent"]

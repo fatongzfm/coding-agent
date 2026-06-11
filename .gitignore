@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+uv.lock
+
+# Packaging
+*.egg-info/
+build/
+dist/
+
+# Test and lint caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Temporary files
+.mini-coding-agent
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# Local scratch space
+tmp/
+.logs/
+
+# OS files
+.DS_Store
+config/default.yaml
