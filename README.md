@@ -156,4 +156,4 @@ pytest tests/ -q
 
 ## 🤝 致谢
 
-本项目受 [mini-coding-agent](https://github.com/rasbt/mini-coding-agent) 启发，在此基础上重构了多智能体编排、实时可观测性与可插拔后端支持。
+本项目受 [mini-coding-agent](https://github.com/rasbt/mini-coding-agent) 启发，在此基础上增加了多智能体编排、实时可观测性与可插拔后端支持。
