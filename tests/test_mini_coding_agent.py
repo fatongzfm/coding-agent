@@ -229,12 +229,69 @@ def test_path_accepts_case_variant_on_case_insensitive_filesystems(tmp_path):
 
 def test_repeated_identical_tool_call_is_rejected(tmp_path):
     agent = build_agent(tmp_path, [])
-    agent.record({"role": "tool", "name": "list_files", "args": {}, "content": "(empty)", "created_at": "1"})
-    agent.record({"role": "tool", "name": "list_files", "args": {}, "content": "(empty)", "created_at": "2"})
+    agent.record({"role": "tool", "name": "run_shell", "args": {"command": "echo hi"}, "content": "hi", "created_at": "1"})
+    agent.record({"role": "tool", "name": "run_shell", "args": {"command": "echo hi"}, "content": "hi", "created_at": "2"})
 
-    result = agent.run_tool("list_files", {})
+    result = agent.run_tool("run_shell", {"command": "echo hi"})
 
-    assert result == "error: repeated identical tool call for list_files; choose a different tool or return a final answer"
+    assert result == "error: repeated identical tool call for run_shell; choose a different tool or return a final answer"
+
+
+def test_repeated_read_only_tool_call_is_allowed(tmp_path):
+    """search may repeat because small models often forget. list_files is limited to 2."""
+    agent = build_agent(tmp_path, [])
+    # list_files: 2 already in history, 3rd call should be rejected.
+    for i in range(2):
+        agent.record({"role": "tool", "name": "list_files", "args": {"path": "."}, "content": "(empty)", "created_at": str(i)})
+
+    result = agent.run_tool("list_files", {"path": "."})
+    assert "error: repeated identical tool call" in result
+
+    # search is still unrestricted.
+    for i in range(5):
+        agent.record({"role": "tool", "name": "search", "args": {"pattern": "x"}, "content": "(empty)", "created_at": str(i)})
+    assert "error: repeated identical tool call" not in agent.run_tool("search", {"pattern": "x"})
+
+
+def test_read_file_repeat_allowed_up_to_three_times(tmp_path):
+    """read_file for the same path is allowed up to 3 times, then rejected."""
+    agent = build_agent(tmp_path, [])
+    (tmp_path / "a.txt").write_text("hello\n", encoding="utf-8")
+
+    # Seed history so repeated_tool_call sees prior reads.
+    for i in range(3):
+        agent.record({"role": "tool", "name": "read_file", "args": {"path": "a.txt"}, "content": "hello", "created_at": str(i)})
+
+    # 4th read should be rejected.
+    assert agent.repeated_tool_call("read_file", {"path": "a.txt"})
+    # A different file is still fine.
+    assert not agent.repeated_tool_call("read_file", {"path": "b.txt"})
+
+
+def test_read_file_repeat_resets_after_write(tmp_path):
+    """A write_file between reads resets the read_file repeat counter."""
+    agent = build_agent(tmp_path, [])
+    (tmp_path / "a.txt").write_text("hello\n", encoding="utf-8")
+
+    # 3 reads in a row – next one should be rejected.
+    for i in range(3):
+        agent.record({"role": "tool", "name": "read_file", "args": {"path": "a.txt"}, "content": "hello", "created_at": str(i)})
+    assert agent.repeated_tool_call("read_file", {"path": "a.txt"})
+
+    # After a write, counter resets.
+    agent.record({"role": "tool", "name": "write_file", "args": {"path": "a.txt", "content": "world\n"}, "content": "wrote", "created_at": "4"})
+    assert not agent.repeated_tool_call("read_file", {"path": "a.txt"})
+
+
+def test_list_files_allowed_up_to_two_times(tmp_path):
+    """list_files is allowed up to 2 times for the same directory, then rejected."""
+    agent = build_agent(tmp_path, [])
+    for i in range(2):
+        agent.record({"role": "tool", "name": "list_files", "args": {"path": "."}, "content": "(empty)", "created_at": str(i)})
+    # 3rd call should be rejected.
+    assert agent.repeated_tool_call("list_files", {"path": "."})
+    # Different directory is still fine.
+    assert not agent.repeated_tool_call("list_files", {"path": "tests"})
 
 
 def test_welcome_screen_keeps_box_shape_for_long_paths(tmp_path):
@@ -455,7 +512,7 @@ def test_coder_role_prompt_contains_coder_instructions(tmp_path):
     )
 
     prefix = coder.build_prefix()
-    assert "Mini-Coding-Agent" in prefix
+    assert "Software Engineer" in prefix
     assert "write_file" in coder.tools
     assert "patch_file" in coder.tools
 
@@ -523,7 +580,7 @@ def test_multi_agent_runner_planner_then_coder(tmp_path):
     )
 
 
-def test_tester_role_has_no_write_tools(tmp_path):
+def test_tester_role_has_write_tools_when_not_read_only(tmp_path):
     workspace = build_workspace(tmp_path)
     store = SessionStore(tmp_path / ".mini-coding-agent" / "sessions")
     tester = MiniAgent(
@@ -532,6 +589,25 @@ def test_tester_role_has_no_write_tools(tmp_path):
         session_store=store,
         approval_policy="auto",
         role="tester",
+        read_only=False,
+    )
+
+    assert "write_file" in tester.tools
+    assert "patch_file" in tester.tools
+    assert "list_files" in tester.tools
+    assert "read_file" in tester.tools
+
+
+def test_tester_role_has_no_write_tools_when_read_only(tmp_path):
+    workspace = build_workspace(tmp_path)
+    store = SessionStore(tmp_path / ".mini-coding-agent" / "sessions")
+    tester = MiniAgent(
+        model_client=FakeModelClient([]),
+        workspace=workspace,
+        session_store=store,
+        approval_policy="auto",
+        role="tester",
+        read_only=True,
     )
 
     assert "write_file" not in tester.tools
@@ -549,11 +625,13 @@ def test_tester_role_prompt_contains_tester_instructions(tmp_path):
         session_store=store,
         approval_policy="auto",
         role="tester",
+        read_only=False,
     )
 
     prefix = tester.build_prefix()
     assert "Quality Assurance Tester" in prefix
-    assert "Do NOT modify any files" in prefix
+    assert "Do NOT run the same pytest command repeatedly" in prefix
+    assert "write_file" in prefix
 
 
 def test_reviewer_role_has_no_write_tools(tmp_path):

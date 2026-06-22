@@ -1,4 +1,5 @@
 import argparse
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -98,8 +99,12 @@ def build_agent(args):
             workspace=workspace,
             session_store=store,
             approval_policy=args.approval,
-            max_steps_planner=args.max_steps,
-            max_steps_coder=args.max_steps,
+            max_steps_planner=getattr(args, "max_steps_planner", args.max_steps),
+            max_steps_coder=getattr(args, "max_steps_coder", args.max_steps),
+            max_steps_tester=getattr(args, "max_steps_tester", args.max_steps),
+            max_steps_reviewer=getattr(args, "max_steps_reviewer", args.max_steps),
+            max_new_tokens=args.max_new_tokens,
+            max_review_cycles=getattr(args, "max_review_cycles", 3),
         )
     session_id = args.resume
     if session_id == "latest":
@@ -131,10 +136,10 @@ def build_arg_parser():
     )
     parser.add_argument("prompt", nargs="*", help="Optional one-shot prompt.")
     parser.add_argument("--cwd", default=".", help="Workspace directory.")
-    parser.add_argument("--model", default="qwen3.5:4b", help="Model name for Ollama or API.")
+    parser.add_argument("--model", default="gpt-4o-mini", help="Model name for Ollama or API.")
     parser.add_argument("--host", default="http://127.0.0.1:11434", help="Ollama server URL.")
     parser.add_argument("--base-url", default=None, help="Base URL for OpenAI-compatible API.")
-    parser.add_argument("--api-key", default=None, help="API key for online LLM. If set, uses OpenAI-compatible API instead of Ollama.")
+    parser.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY") or os.environ.get("MINI_CODING_AGENT_API_KEY"), help="API key for online LLM. Falls back to OPENAI_API_KEY env var. If set, uses OpenAI-compatible API instead of Ollama.")
     parser.add_argument("--config", default=None, help="Path to YAML config file. Defaults to config/default.yaml.")
     parser.add_argument("--ollama-timeout", type=int, default=300, help="Request timeout in seconds.")
     parser.add_argument("--resume", default=None, help="Session id to resume or 'latest'.")
@@ -144,42 +149,60 @@ def build_arg_parser():
         default="ask",
         help="Approval policy for risky tools; auto grants the model arbitrary command execution and file writes.",
     )
-    parser.add_argument("--max-steps", type=int, default=6, help="Maximum tool/model iterations per request.")
-    parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum model output tokens per step.")
+    parser.add_argument("--max-steps", type=int, default=10, help="Maximum tool/model iterations per request.")
+    parser.add_argument("--max-new-tokens", type=int, default=2048, help="Maximum model output tokens per step.")
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to Ollama.")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling value sent to Ollama.")
     parser.add_argument(
         "--mode",
         choices=("single", "multi"),
-        default="single",
+        default="multi",
         help="Agent mode: single agent or multi-agent (planner + coder).",
     )
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging.")
     parser.add_argument("--quiet", action="store_true", help="Suppress non-error output.")
     parser.add_argument("--log-dir", default=".logs", help="Directory for log files.")
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="Start the observability dashboard server instead of running the agent.",
+    )
+    parser.add_argument("--server-host", default="0.0.0.0", help="Dashboard server host.")
+    parser.add_argument("--server-port", type=int, default=8080, help="Dashboard server port.")
     return parser
 
 
 def main(argv=None):
     args = build_arg_parser().parse_args(argv)
 
+    if args.serve:
+        import logging
+        import uvicorn
+        from mini_coding_agent.logging_config import setup_logging
+        from mini_coding_agent.server import app
+
+        log_level = logging.DEBUG if args.verbose else (logging.WARNING if args.quiet else logging.INFO)
+        setup_logging(level=log_level, log_dir=args.log_dir)
+
+        print(f"Starting dashboard server at http://{args.server_host}:{args.server_port}")
+        uvicorn.run(app, host=args.server_host, port=args.server_port)
+        return 0
+
     # Load config and apply fallback values for api_key / base_url
     from mini_coding_agent.config import load_config
 
     cfg = load_config(args.config)
     model_cfg = cfg.get("model", {})
+    multi_cfg = cfg.get("multi_agent", {})
     if args.api_key is None:
         args.api_key = model_cfg.get("api_key")
     if args.base_url is None:
         args.base_url = model_cfg.get("base_url", "https://api.openai.com/v1")
-    if args.model == "qwen3.5:4b" and "name" in model_cfg:
-        args.model = model_cfg["name"]
-    if args.temperature == 0.2 and "temperature" in model_cfg:
-        args.temperature = model_cfg["temperature"]
-    if args.top_p == 0.9 and "top_p" in model_cfg:
-        args.top_p = model_cfg["top_p"]
-    if args.max_new_tokens == 512 and "max_new_tokens" in model_cfg:
-        args.max_new_tokens = model_cfg["max_new_tokens"]
+    args.max_review_cycles = multi_cfg.get("max_review_cycles", 3)
+    args.max_steps_planner = multi_cfg.get("max_steps_planner", args.max_steps)
+    args.max_steps_coder = multi_cfg.get("max_steps_coder", args.max_steps)
+    args.max_steps_tester = multi_cfg.get("max_steps_tester", args.max_steps)
+    args.max_steps_reviewer = multi_cfg.get("max_steps_reviewer", args.max_steps)
 
     import logging
     from mini_coding_agent.logging_config import setup_logging

@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mini-Coding-Agent Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css?v=3">
+</head>
+<body>
+  <header>
+    <h1>Mini-Coding-Agent Dashboard</h1>
+    <div id="connection-status" class="status disconnected">Disconnected</div>
+  </header>
+
+  <div class="input-bar">
+    <input id="task-input" type="text" placeholder="输入需求，例如：请实现一个快速排序算法…" />
+    <button id="task-submit">运行</button>
+  </div>
+
+  <main>
+    <section class="left">
+      <div class="panel">
+        <h2>Workflow</h2>
+        <div id="workflow-graph" class="graph"></div>
+      </div>
+      <div class="panel">
+        <h2>Run Info</h2>
+        <div id="run-info" class="run-info">
+          <p>Waiting for a run to start...</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="right">
+      <div class="panel">
+        <h2>Event Log</h2>
+        <div id="event-log" class="log"></div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

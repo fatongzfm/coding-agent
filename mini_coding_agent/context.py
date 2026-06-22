@@ -6,9 +6,12 @@ from pathlib import Path
 
 
 DOC_NAMES = ("AGENTS.md", "README.md", "pyproject.toml", "package.json")
-MAX_TOOL_OUTPUT = 4000
-MAX_HISTORY = 12000
-IGNORED_PATH_NAMES = {".git", ".mini-coding-agent", "__pycache__", ".pytest_cache", ".ruff_cache", ".venv", "venv"}
+MAX_TOOL_OUTPUT = 6000
+MAX_HISTORY = 9000
+IGNORED_PATH_NAMES = {".git", ".mini-coding-agent", "__pycache__", ".pytest_cache", ".ruff_cache", ".venv", "venv", ".logs", ".vscode"}
+
+# File names that are part of the agent's own codebase and irrelevant to user tasks.
+IGNORED_FILE_NAMES = {"test_mini_coding_agent.py"}
 
 
 def now():

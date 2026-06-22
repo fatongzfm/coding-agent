@@ -15,9 +15,11 @@ from mini_coding_agent.context import (
     middle,
     now,
     IGNORED_PATH_NAMES,
+    IGNORED_FILE_NAMES,
     MAX_HISTORY,
     MAX_TOOL_OUTPUT,
 )
+from mini_coding_agent.observability import make_emitter
 
 class AgentState(TypedDict):
     tool_steps: int
@@ -53,8 +55,10 @@ def _make_call_model_node(agent):
     def call_model_node(state: AgentState):
         prompt = agent.prompt(state["user_message"])
         logger.debug("model_call role=%s prompt_chars=%d max_tokens=%d", agent.role, len(prompt), agent.max_new_tokens)
+        agent.emit(agent.role, "llm_call", {"prompt_chars": len(prompt), "max_tokens": agent.max_new_tokens})
         raw = agent.model_client.complete(prompt, agent.max_new_tokens)
         logger.debug("model_response role=%s response_chars=%d", agent.role, len(raw))
+        agent.emit(agent.role, "llm_output", {"raw": raw, "response_chars": len(raw)})
         return {"raw_output": raw, "attempts": state["attempts"] + 1}
     return call_model_node
 
@@ -80,6 +84,7 @@ def _make_handle_tool_node(agent):
             "tool_execution tool=%s duration_ms=%d result_chars=%d",
             name, duration_ms, len(result),
         )
+        agent.emit(agent.role, "tool_result", {"tool": name, "args": args, "result": result, "duration_ms": duration_ms})
         agent.record(
             {
                 "role": "tool",
@@ -101,6 +106,7 @@ def _make_handle_retry_node(agent):
         payload = state["parse_payload"]
         agent.record({"role": "assistant", "content": payload, "created_at": now()})
         logger.debug("retry_notice role=%s", agent.role)
+        agent.emit(agent.role, "retry", {"reason": str(payload)})
         return {}
     return handle_retry_node
 
@@ -114,6 +120,7 @@ def _make_handle_final_node(agent):
         agent.record({"role": "assistant", "content": final, "created_at": now()})
         agent.remember(agent.session["memory"]["notes"], clip(final, 220), 5)
         logger.info("final_answer role=%s answer_chars=%d", agent.role, len(final))
+        agent.emit(agent.role, "final_answer", {"answer": final})
         return {"final_answer": final}
     return handle_final_node
 
@@ -198,10 +205,17 @@ class MiniAgent:
             "history": [],
             "memory": {"task": "", "files": [], "notes": []},
         }
+        self.run_id: str | None = None
         self.tools = self.build_tools()
         self.prefix = self.build_prefix()
         self.session_path = self.session_store.save(self.session)
         self.graph = _build_agent_graph(self)
+
+    def emit(self, node: str, event_type: str, payload: dict | None = None):
+        if self.run_id is None:
+            return
+        emitter = make_emitter(self.run_id)
+        emitter(node, event_type, payload)
 
     @classmethod
     def from_session(cls, model_client, workspace, session_store, session_id, **kwargs):
@@ -252,17 +266,17 @@ class MiniAgent:
                 "run": self.tool_run_shell,
             },
         }
-        if self.role == "coder":
+        if self.role == "coder" or (self.role == "tester" and not self.read_only):
             tools["write_file"] = {
                 "schema": {"path": "str", "content": "str"},
                 "risky": True,
-                "description": "Write a text file.",
+                "description": 'Write a text file. MUST use XML: <tool name="write_file" path="file.py"><content>...</content></tool>',
                 "run": self.tool_write_file,
             }
             tools["patch_file"] = {
                 "schema": {"path": "str", "old_text": "str", "new_text": "str"},
                 "risky": True,
-                "description": "Replace one exact text block in a file.",
+                "description": 'Replace one exact text block in a file. MUST use XML: <tool name="patch_file" path="file.py"><old_text>...</old_text><new_text>...</new_text></tool>',
                 "run": self.tool_patch_file,
             }
         if self.depth < self.max_depth:
@@ -278,69 +292,148 @@ class MiniAgent:
     #### 2) Prompt Shape And Cache Reuse #######
     ############################################
     def build_prefix(self):
+        # Build tool list: read-only agents don't need write_file / patch_file
+        is_read_only = self.read_only
         tool_lines = []
         for name, tool in self.tools.items():
+            if is_read_only and name in ("write_file", "patch_file"):
+                continue
             fields = ", ".join(f"{key}: {value}" for key, value in tool["schema"].items())
             risk = "approval required" if tool["risky"] else "safe"
             tool_lines.append(f"- {name}({fields}) [{risk}] {tool['description']}")
         tool_text = "\n".join(tool_lines)
-        examples = "\n".join(
-            [
-                '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
-                '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
-                '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
-                '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
-                '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
-                "<final>Done.</final>",
-            ]
-        )
-        rules = "\n".join([
+
+        # Examples: read-only roles don't need write_file / patch_file XML examples
+        if is_read_only:
+            examples = "\n".join(
+                [
+                    '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
+                    '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
+                    '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
+                    "<final>Done.</final>",
+                ]
+            )
+        else:
+            examples = "\n".join(
+                [
+                    '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
+                    '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
+                    '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
+                    '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
+                    '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
+                    "<final>Done.</final>",
+                ]
+            )
+
+        # Rules: read-only roles don't need XML file-writing rules
+        common_rules = [
             "- Use tools instead of guessing about the workspace.",
-            "- Return exactly one <tool>...</tool> or one <final>...</final>.",
+            "- Return exactly ONE <tool>...</tool> or ONE <final>...</final>. Multiple tools in a single response are NOT allowed.",
             "- Tool calls must look like:",
             '  <tool>{"name":"tool_name","args":{...}}</tool>',
-            "- For write_file and patch_file with multi-line text, prefer XML style:",
+        ]
+        write_rules = [
+            "- For write_file and patch_file you MUST use XML style. JSON is NOT allowed for these tools:",
             '  <tool name="write_file" path="file.py"><content>...</content></tool>',
+            '  <tool name="patch_file" path="file.py"><old_text>...</old_text><new_text>...</new_text></tool>',
+        ]
+        final_rules = [
             "- Final answers must look like:",
             "  <final>your answer</final>",
             "- Never invent tool results.",
             "- Keep answers concise and concrete.",
+        ]
+        coder_rules = [
             "- If the user asks you to create or update a specific file and the path is clear, use write_file or patch_file instead of repeatedly listing files.",
             "- Before writing tests for existing code, read the implementation first.",
             "- When writing tests, match the current implementation unless the user explicitly asked you to change the code.",
             "- New files should be complete and runnable, including obvious imports.",
-            "- Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool or return a final answer.",
-            "- Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, or delegate with args={}.",
-        ])
-        if self.role == "planner":
+            "- If tests fail, read the error output carefully, fix the code, then re-run tests. Do NOT repeat the same test command without fixing the code first.",
+        ]
+        if is_read_only:
+            rules = "\n".join(common_rules + final_rules + [
+                "- Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool or return a final answer.",
+                "- Required tool arguments must not be empty. Do not call read_file, run_shell, or delegate with args={}.",
+            ])
+        else:
+            rules = "\n".join(common_rules + write_rules + final_rules + coder_rules + [
+                "- Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool or return a final answer.",
+                "- Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, or delegate with args={}.",
+            ])
+        # Load role identity from config if available, else fallback to defaults
+        from mini_coding_agent.config import load_config
+        cfg = load_config(None)
+        roles_cfg = cfg.get("roles", {})
+        role_cfg = roles_cfg.get(self.role, {})
+        if role_cfg.get("identity"):
+            identity = role_cfg["identity"]
+        elif self.role == "planner":
             identity = (
                 "You are a Software Architect Planner, a specialized agent that analyzes "
-                "requirements and produces detailed implementation plans. Do NOT write code. "
-                "Only produce a plan. Use read_file, search, and list_files to understand "
-                "the existing codebase before planning."
+                "requirements and produces implementation plans. Do NOT write code. "
+                "Only produce a concise plan (under 150 words).\n\n"
+                "EFFICIENCY RULES:\n"
+                "- You have a LIMITED step budget. Do NOT waste steps reading large unrelated files.\n"
+                "- Do NOT read the project's own test files (e.g. tests/test_mini_coding_agent.py) "
+                "unless the task explicitly asks about them.\n"
+                "- Use search FIRST to check if the requested functionality already exists, "
+                "before listing directories or reading files.\n"
+                "- If the task is straightforward (e.g. implementing a single algorithm), "
+                "output the plan in 1-2 steps without deep exploration.\n"
+                "- Do NOT read the same file more than once.\n"
+                "- If you see the code you need already exists, mention it in the plan and stop.\n\n"
+                "ROLE ASSIGNMENT:\n"
+                "- Your plan should ONLY contain implementation steps for the [coder].\n"
+                "- Do NOT include testing steps, test files, or any [tester] assignments in your plan.\n"
+                "- The [coder] only writes implementation source files (e.g. src/, lib/, module code).\n"
+                "- Testing will be handled later by the tester after the coder finishes."
             )
         elif self.role == "tester":
             identity = (
-                "You are a Quality Assurance Tester, a specialized read-only agent that "
-                "validates code correctness, runs tests, checks edge cases, and reports findings. "
-                "Do NOT modify any files. Use run_shell, read_file, and search to inspect and test "
-                "the implementation. Return a concise test report with pass/fail status and a list "
-                "of issues found."
+                "You are a Quality Assurance Tester. The coder has written the implementation "
+                "but did NOT write tests. Your job is to write tests, run them, and report the results.\n\n"
+                "EFFICIENCY RULES:\n"
+                "- You have a VERY LIMITED step budget. Read each file AT MOST ONCE.\n"
+                "- If read_file returns 'repeated identical tool call', that means you already have the file content. "
+                "Do NOT try to read it again — use what you already know.\n"
+                "- If list_files returns 'repeated identical tool call', that means you already listed this directory. "
+                "Do NOT try to list it again.\n"
+                "- If all tests already pass and coverage is adequate, return a final answer immediately. "
+                "Do NOT run the same pytest command repeatedly.\n"
+                "- Write focused tests, run them, and return a concise pass/fail report with any issues found."
             )
         elif self.role == "reviewer":
             identity = (
                 "You are a Senior Code Reviewer, a specialized read-only agent that performs "
-                "code review, security checks, and best-practice validation. Do NOT modify any files. "
-                "Use read_file and search to inspect the implementation and the test report. "
+                "code review, security checks, and best-practice validation. Do NOT modify any files.\n\n"
+                "EFFICIENCY RULES:\n"
+                "- You have a VERY LIMITED step budget (only a few steps). Be EXTREMELY efficient.\n"
+                "- If the coder has already reported that tests PASSED, and the implementation looks correct, "
+                "you may directly return <final>approved</final> without re-reading files.\n"
+                "- If read_file returns 'repeated identical tool call', that means the file has already been read. "
+                "Do NOT try to read it again — use what you already know.\n"
+                "- Read each file AT MOST ONCE.\n"
                 "Return your verdict as either:\n"
                 "  <final>approved</final>\n"
                 "or\n"
-                "  <final>needs_fix: [detailed feedback]</final>"
+                "  <final>needs_fix: [specific, actionable feedback]</final>"
             )
         else:
             identity = (
-                "You are Mini-Coding-Agent, a small local coding agent running through Ollama. "
-                "Implement the given plan by writing complete, runnable code with tests."
+                "You are an expert Software Engineer. Your job is to implement the given plan "
+                "by writing complete, runnable code. You MUST follow the plan exactly.\n\n"
+                "EFFICIENCY RULES:\n"
+                "- You have a LIMITED step budget. Focus on writing code, not exploring files.\n"
+                "- Do NOT read the same file more than once. If you need to reference it again, use what you already know.\n"
+                "- Do NOT write tests — the tester will write them. Only write the implementation code.\n"
+                "- If read_file returns 'repeated identical tool call', that means you already have the file content. "
+                "Do NOT try to read it again — use what you already know.\n"
+                "- If the plan is clear, start writing code immediately without excessive file exploration.\n\n"
+                "OUTPUT RULES:\n"
+                "- After completing the implementation, your final answer MUST include a 'Test Plan' section "
+                "describing what tests the tester should write (e.g., edge cases, error inputs, boundary conditions, "
+                "and expected behaviors).\n"
+                "- Do NOT run tests yourself unless they are broken and need fixing."
             )
         return "\n\n".join([
             identity,
@@ -371,7 +464,7 @@ class MiniAgent:
 
         lines = []
         seen_reads = set()
-        recent_start = max(0, len(history) - 6)
+        recent_start = max(0, len(history) - 10)
         for index, item in enumerate(history):
             recent = index >= recent_start
             if item["role"] == "tool" and item["name"] in ("write_file", "patch_file"):
@@ -384,11 +477,14 @@ class MiniAgent:
                 seen_reads.add(path)
 
             if item["role"] == "tool":
-                limit = 900 if recent else 180
+                limit = 900 if recent else 100
+                # P1: aggressively compress large read_file results in history
+                if item["name"] == "read_file" and not recent and len(item.get("content", "")) > 1500:
+                    limit = 60
                 lines.append(f"[tool:{item['name']}] {json.dumps(item['args'], sort_keys=True)}")
                 lines.append(clip(item["content"], limit))
             else:
-                limit = 900 if recent else 220
+                limit = 900 if recent else 120
                 lines.append(f"[{item['role']}] {clip(item['content'], limit)}")
 
         return clip("\n".join(lines), MAX_HISTORY)
@@ -443,6 +539,20 @@ class MiniAgent:
     #############################################################
     #### 3) Structured Tools, Validation, And Permissions #######
     #############################################################
+    def _read_file_preview(self, path: str, limit: int = 100) -> str:
+        """Return a short preview of a file for use in error messages."""
+        try:
+            resolved = self.path(path)
+            if not resolved.is_file():
+                return ""
+            text = resolved.read_text(encoding="utf-8", errors="replace")
+            preview = text[:limit].replace("\n", " ")
+            if len(text) > limit:
+                preview += " ..."
+            return preview
+        except Exception:
+            return ""
+
     def run_tool(self, name, args):
         tool = self.tools.get(name)
         if tool is None:
@@ -456,6 +566,19 @@ class MiniAgent:
                 message += f"\nexample: {example}"
             return message
         if self.repeated_tool_call(name, args):
+            if name == "read_file":
+                preview = self._read_file_preview(args.get("path", ""))
+                return (
+                    f"error: repeated identical tool call for {name}. "
+                    f"You have already read this file. Content preview: {preview}\n"
+                    f"Choose a different tool or return a final answer."
+                )
+            if name == "list_files":
+                return (
+                    f"error: repeated identical tool call for {name}. "
+                    f"You have already listed this directory. "
+                    f"Choose a different tool or return a final answer."
+                )
             return f"error: repeated identical tool call for {name}; choose a different tool or return a final answer"
         if tool["risky"] and not self.approve(name, args):
             return f"error: approval denied for {name}"
@@ -465,11 +588,61 @@ class MiniAgent:
             return f"error: tool {name} failed: {exc}"
 
     def repeated_tool_call(self, name, args):
-        tool_events = [item for item in self.session["history"] if item["role"] == "tool"]
-        if len(tool_events) < 2:
+        """Reject only truly pointless repeats.
+
+        A repeat is allowed if the agent has written or patched a file since the
+        previous identical call — the workspace state may have changed.
+        search is always allowed to repeat because small models often "forget".
+        list_files is allowed up to 2 times for the same directory.
+        read_file is allowed up to 3 times for the same file before being
+        rejected, to prevent step exhaustion from repetitive re-reading.
+        """
+        if name == "search":
             return False
-        recent = tool_events[-2:]
-        return all(item["name"] == name and item["args"] == args for item in recent)
+        if name == "list_files":
+            path = str(args.get("path", "."))
+            count = 0
+            for item in reversed(self.session["history"]):
+                if (
+                    item.get("role") == "tool"
+                    and item.get("name") == "list_files"
+                    and str(item.get("args", {}).get("path", ".")) == path
+                ):
+                    count += 1
+            return count >= 2
+        if name == "read_file":
+            path = str(args.get("path", ""))
+            if not path:
+                return False
+            # Count how many times this file has been read since the last write.
+            count = 0
+            for item in reversed(self.session["history"]):
+                if item.get("role") == "tool" and item.get("name") in ("write_file", "patch_file"):
+                    break
+                if (
+                    item.get("role") == "tool"
+                    and item.get("name") == "read_file"
+                    and str(item.get("args", {}).get("path", "")) == path
+                ):
+                    count += 1
+            return count >= 3
+        history = self.session["history"]
+        if len(history) < 2:
+            return False
+
+        # Walk backwards by index to find the previous identical tool call.
+        for i in range(len(history) - 2, -1, -1):
+            item = history[i]
+            if item["role"] == "tool" and item["name"] == name and item["args"] == args:
+                # If any write/patch happened between then and now, the repeat is justified.
+                for mid in history[i + 1 :]:
+                    if mid["role"] == "tool" and mid["name"] in ("write_file", "patch_file"):
+                        return False
+                return True
+            # Stop searching once we hit a *different* tool call of the same name.
+            if item["role"] == "tool" and item["name"] == name:
+                break
+        return False
 
     def tool_example(self, name):
         examples = {
@@ -550,6 +723,9 @@ class MiniAgent:
             return
 
     def approve(self, name, args):
+        # Tester needs run_shell to execute tests; it is still read-only for file writes.
+        if self.read_only and name == "run_shell":
+            return True
         if self.read_only:
             return False
         if self.approval_policy == "auto":
@@ -565,12 +741,24 @@ class MiniAgent:
     @staticmethod
     def parse(raw):
         raw = str(raw)
+        # Some models output multiple <tool> blocks at once; keep only the first one.
+        if raw.count("<tool>") > 1 or raw.count("<tool ") > 1:
+            first_tag = raw.find("<tool>")
+            if first_tag == -1:
+                first_tag = raw.find("<tool ")
+            close_tag = raw.find("</tool>", first_tag)
+            if close_tag != -1:
+                raw = raw[first_tag : close_tag + len("</tool>")]
         if "<tool>" in raw and ("<final>" not in raw or raw.find("<tool>") < raw.find("<final>")):
             body = MiniAgent.extract(raw, "tool")
+            payload = None
             try:
                 payload = json.loads(body)
             except Exception:
-                return "retry", MiniAgent.retry_notice("model returned malformed tool JSON")
+                # Tolerance: try to recover flat JSON for write_file / patch_file
+                payload = MiniAgent._recover_flat_json(body)
+                if payload is None:
+                    return "retry", MiniAgent.retry_notice("model returned malformed tool JSON")
             if not isinstance(payload, dict):
                 return "retry", MiniAgent.retry_notice("tool payload must be a JSON object")
             if not str(payload.get("name", "")).strip():
@@ -580,6 +768,11 @@ class MiniAgent:
                 payload["args"] = {}
             elif not isinstance(args, dict):
                 return "retry", MiniAgent.retry_notice()
+            # Tolerance: promote top-level keys to args for write_file / patch_file
+            name = str(payload.get("name", "")).strip()
+            if name in ("write_file", "patch_file") and not args:
+                args = {k: v for k, v in payload.items() if k not in ("name", "args")}
+                payload["args"] = args
             return "tool", payload
         if "<tool" in raw and ("<final>" not in raw or raw.find("<tool") < raw.find("<final>")):
             payload = MiniAgent.parse_xml_tool(raw)
@@ -597,6 +790,31 @@ class MiniAgent:
         return "retry", MiniAgent.retry_notice("model returned an empty response")
 
     @staticmethod
+    def _recover_flat_json(body: str) -> dict | None:
+        """Best-effort recovery for models that put fields at top-level instead of inside args."""
+        # Try to extract name, path, content, old_text, new_text with regex
+        name_match = re.search(r'"name"\s*:\s*"([^"]*)"', body)
+        if not name_match:
+            return None
+        name = name_match.group(1)
+        if name not in ("write_file", "patch_file"):
+            return None
+        result = {"name": name, "args": {}}
+        for key in ("path", "content", "old_text", "new_text"):
+            pattern = rf'"{key}"\s*:\s*"((?:\\.|[^"\\])*)"'
+            m = re.search(pattern, body)
+            if m:
+                # Unescape JSON string
+                raw_val = m.group(1)
+                try:
+                    result["args"][key] = json.loads(f'"{raw_val}"')
+                except Exception:
+                    result["args"][key] = raw_val
+        if not result["args"]:
+            return None
+        return result
+
+    @staticmethod
     def retry_notice(problem=None):
         prefix = "Runtime notice"
         if problem:
@@ -605,7 +823,7 @@ class MiniAgent:
             prefix += ": model returned malformed tool output"
         return (
             f"{prefix}. Reply with a valid <tool> call or a non-empty <final> answer. "
-            'For multi-line files, prefer <tool name="write_file" path="file.py"><content>...</content></tool>.'
+            'For write_file and patch_file you MUST use XML: <tool name="write_file" path="file.py"><content>...</content></tool>.'
         )
 
     @staticmethod
@@ -689,13 +907,16 @@ class MiniAgent:
             raise ValueError(f"path escapes workspace: {raw_path}")
         return resolved
 
+    def _is_ignored_file(self, path: Path) -> bool:
+        return path.name in IGNORED_FILE_NAMES
+
     def tool_list_files(self, args):
         path = self.path(args.get("path", "."))
         if not path.is_dir():
             raise ValueError("path is not a directory")
         entries = [
             item for item in sorted(path.iterdir(), key=lambda item: (item.is_file(), item.name.lower()))
-            if item.name not in IGNORED_PATH_NAMES
+            if item.name not in IGNORED_PATH_NAMES and not self._is_ignored_file(item)
         ]
         lines = []
         for entry in entries[:200]:
@@ -707,6 +928,11 @@ class MiniAgent:
         path = self.path(args["path"])
         if not path.is_file():
             raise ValueError("path is not a file")
+        if self._is_ignored_file(path):
+            return (
+                f"# {path.relative_to(self.root)}\n"
+                "   1: (This file is part of the agent's own test suite and is irrelevant to the current task.)"
+            )
         start = int(args.get("start", 1))
         end = int(args.get("end", 200))
         if start < 1 or end < start:
@@ -728,12 +954,19 @@ class MiniAgent:
                 capture_output=True,
                 text=True,
             )
-            return result.stdout.strip() or result.stderr.strip() or "(no matches)"
+            lines = result.stdout.strip().splitlines()
+            filtered = [
+                line for line in lines
+                if not any(name in line for name in IGNORED_FILE_NAMES)
+            ]
+            return "\n".join(filtered) or result.stderr.strip() or "(no matches)"
 
         matches = []
         files = [path] if path.is_file() else [
             item for item in path.rglob("*")
-            if item.is_file() and not any(part in IGNORED_PATH_NAMES for part in item.relative_to(self.root).parts)
+            if item.is_file()
+            and not any(part in IGNORED_PATH_NAMES for part in item.relative_to(self.root).parts)
+            and not self._is_ignored_file(item)
         ]
         for file_path in files:
             for number, line in enumerate(file_path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):

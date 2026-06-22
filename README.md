@@ -1,189 +1,163 @@
-# Mini-Coding-Agent 使用指南
+# Mini-Coding-Agent
 
-本项目是一个基于 LangGraph 的多智能体编码助手，支持**单智能体**和**多智能体（规划器 + 编码器 + 测试器 + 审查器）**两种模式。以下以**二分查找**为例介绍如何用它来**自动编写代码并自动测试**。
+> 基于 **LangGraph** 的多智能体编码助手，支持 Planner → Coder → Tester → Reviewer 四角色协作与实时可视化监控。
 
----
+<p align="center">
+  <img src="multi_agent_flow.png" alt="Multi-Agent Workflow" width="700">
+</p>
 
-## 一、环境准备
+## ✨ 项目亮点
+
+- **🧠 多智能体流水线（Multi-Agent Pipeline）** — 基于 LangGraph 编排 Planner、Coder、Tester、Reviewer 四角色，支持自动反馈循环（feedback loop），实现「规划 → 编码 → 测试 → 评审」的闭环协作。
+- **📊 实时监控面板（Real-Time Dashboard）** — 基于 FastAPI + WebSocket 的 Web UI，可实时观察各 Agent 的执行状态、节点高亮、事件流推送。
+- **🔧 角色可配置（Configurable Roles）** — 通过 YAML 定义各角色的身份（identity）、工具权限与策略，无需修改代码即可调整 Prompt 或替换模型。
+- **🤖 多后端模型支持** — 支持 Ollama（本地）及任意 OpenAI 兼容 API（OpenAI、Moonshot、DeepSeek 等），可一键切换。
+- **🛡️ 容错解析** — 自动修复模型输出的畸形 JSON/XML 工具调用；支持单轮多 tool 输出截断保护。
+- **💾 会话持久化** — 单智能体会话支持断点续传，从磁盘恢复历史上下文。
+- **🔒 权限管控** — 针对 `write_file`、`run_shell` 等高危工具，支持 `ask` / `auto` / `never` 三级审批策略。
+
+## 🏗 系统架构
+
+```
+┌─────────────┐     ┌──────────┐     ┌────────┐     ┌────────┐     ┌──────────┐
+│   Browser   │◄────┤ FastAPI  │────►│ Event  │────►│LangGraph│────►│  LLM   │
+│  Dashboard  │ WS  │  Server  │     │  Bus   │     │ Workflow│     │(Ollama │
+└─────────────┘     └──────────┘     └────────┘     └────────┘     │ / API) │
+                                                                      └────────┘
+                                                                         │
+                                    ┌────────────────────────────────────┘
+                                    ▼
+                         ┌─────────────────────┐
+                         │  Supervisor (Graph) │
+                         └──────────┬──────────┘
+                                    │
+            ┌──────────┬───────────┼───────────┬──────────┐
+            ▼          ▼           ▼           ▼          ▼
+       ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
+       │ START  │ │Planner │ │ Coder  │ │ Tester │ │Reviewer│
+       └────────┘ └────────┘ └────────┘ └────────┘ └────────┘
+                                    ▲           │
+                                    └───────────┘
+                                   needs_fix loop (max 5 cycles)
+```
+
+## 🚀 快速开始
 
 ### 1. 安装依赖
 
-```bash
-# 使用 uv 安装（推荐）
-uv pip install -e .
+**方式一：使用 conda + pip（常用）**
 
-# 或使用 pip
+```bash
+# 创建并激活虚拟环境
+conda create -n mca python=3.12
+conda activate mca
+
+# 安装运行时依赖
+pip install -r requirements.txt
+
+# 开发调试时，可额外安装开发依赖
+pip install -r requirements-dev.txt
+```
+
+**方式二：使用 uv（推荐，更快）**
+
+```bash
+uv pip install -e .
+```
+
+**方式三：直接使用 pip**
+
+```bash
 pip install -e .
 ```
 
-### 2. 启动模型服务
+### 2. 配置模型
 
-#### 方式 A：使用 Ollama（本地模型，默认）
-
-```bash
-# 启动 Ollama 服务
-ollama serve
-
-# 拉取模型（以 qwen3.5:4b 为例）
-ollama pull qwen3.5:4b
-```
-
-#### 方式 B：使用 OpenAI 兼容 API（如 GPT-4、Claude 等）
-
-无需本地模型，通过配置 `api_key` 和 `base_url` 即可使用在线 API。
-
----
-
-## 二、使用单智能体模式编写并测试二分查找
-
-单智能体模式适合快速任务，一个智能体即可完成代码编写和测试。
-
-### 1. 交互模式
-
-```bash
-python -m mini_coding_agent \
-  --model qwen3.5:4b \
-  --approval auto
-```
-
-进入交互界面后输入：
-
-```
-请编写一个二分查找函数 binary_search(nums, target)，要求：
-1. 如果找到目标值，返回其索引；
-2. 如果未找到，返回 -1；
-3. 编写 pytest 测试文件 tests/test_binary_search.py，覆盖正常查找、边界值、空数组等情况；
-4. 运行测试并确保全部通过。
-```
-
-### 2. 一次性命令模式（非交互）
-
-```bash
-python -m mini_coding_agent \
-  --model qwen3.5:4b \
-  --approval auto \
-  --max-steps 10 \
-  "请编写二分查找函数 binary_search(nums, target) 并保存到 src/binary_search.py，同时编写 tests/test_binary_search.py 进行 pytest 测试，确保测试通过。"
-```
-
----
-
-## 三、使用多智能体模式编写并测试二分查找（推荐）
-
-多智能体模式会自动调用 **规划器（Planner）→ 编码器（Coder）→ 测试器（Tester）→ 审查器（Reviewer）** 的流水线，自动完成规划、编码、测试和审查，更适合复杂任务。
-
-### 多智能体流程图
-
-![多智能体自动编码与测试流程图](multi_agent_flow.png)
-
-**流程说明：**
-
-1. **Supervisor**：接收用户请求，按顺序调度各智能体
-2. **Planner**：分析需求，制定实现计划（只读，不写代码）
-3. **Coder**：根据计划编写代码和测试文件（可写入文件）
-4. **Tester**：运行测试、验证功能、检查边界条件（只读）
-5. **Reviewer**：审查代码和测试报告，给出 `approved` 或 `needs_fix`  verdict
-6. **循环修复**：若审查未通过，Coder 根据反馈自动修复，最多循环 **3 次**
-
-### 1. 使用 Ollama 运行
-
-```bash
-python -m mini_coding_agent \
-  --mode multi \
-  --model qwen3.5:4b \
-  --approval auto \
-  --max-steps 10 \
-  "请实现一个健壮的二分查找算法 binary_search(nums, target)，包含完整的单元测试和边缘情况处理。"
-```
-
-### 2. 使用 OpenAI 兼容 API 运行
-
-```bash
-python -m mini_coding_agent \
-  --mode multi \
-  --model gpt-4o-mini \
-  --api-key "sk-your-api-key" \
-  --base-url "https://api.openai.com/v1" \
-  --approval auto \
-  --max-steps 10 \
-  "请实现一个健壮的二分查找算法 binary_search(nums, target)，包含完整的单元测试和边缘情况处理。"
-```
-
----
-
-## 四、常用命令行参数说明
-
-| 参数 | 说明 | 示例 |
-|------|------|------|
-| `--mode` | 运行模式：`single`（单智能体）或 `multi`（多智能体） | `--mode multi` |
-| `--model` | 模型名称 | `--model qwen3.5:4b` |
-| `--host` | Ollama 服务地址（默认 `http://127.0.0.1:11434`） | `--host http://localhost:11434` |
-| `--api-key` | OpenAI 兼容 API 的密钥 | `--api-key sk-xxx` |
-| `--base-url` | OpenAI 兼容 API 的基础地址 | `--base-url https://api.openai.com/v1` |
-| `--approval` | 风险操作审批策略：`ask`（询问）、`auto`（自动）、`never`（禁止） | `--approval auto` |
-| `--max-steps` | 每个智能体的最大工具调用步数 | `--max-steps 10` |
-| `--max-new-tokens` | 每次模型生成的最大 token 数 | `--max-new-tokens 1024` |
-| `--config` | 指定 YAML 配置文件路径 | `--config config/default.yaml` |
-
----
-
-## 五、使用自定义配置文件
-
-项目支持通过 YAML 文件统一管理配置。示例配置文件 `config/default.yaml`：
+编辑 `config/default.yaml`：
 
 ```yaml
 model:
-  name: "qwen3.5:4b"
-  host: "http://127.0.0.1:11434"
+  name: "gpt-4o-mini"
+  api_key: "sk-your-api-key"
+  base_url: "https://api.openai.com/v1"
   temperature: 0.2
-  top_p: 0.9
-  timeout: 300
-  max_new_tokens: 512
+  max_new_tokens: 2048
 
 agent:
-  max_steps: 6
-  approval_policy: "ask"
-
-multi_agent:
-  max_steps_planner: 15
-  max_steps_coder: 10
-  max_steps_tester: 5
-  max_steps_reviewer: 5
+  approval_policy: "auto"
 ```
 
-使用配置文件运行：
+> 本地模型使用 Ollama：
+> ```yaml
+> model:
+>   name: "qwen3.5:4b"
+>   host: "http://127.0.0.1:11434"
+> ```
+
+### 3. 启动监控面板
+
+```bash
+python -m mini_coding_agent --serve
+```
+
+打开 http://localhost:8080，输入需求后点击 **运行**。
+
+### 4. 命令行模式（单次运行）
 
 ```bash
 python -m mini_coding_agent \
-  --config config/default.yaml \
   --mode multi \
   --approval auto \
-  "请实现二分查找算法并编写测试。"
+  "请实现一个快速排序算法"
 ```
 
----
+## 🎛 配置说明
 
-## 六、交互式命令
+```yaml
+model:
+  name: "gpt-4o-mini"           # 模型标识
+  api_key: ""                   # API Key（也可通过环境变量 OPENAI_API_KEY 传入）
+  base_url: "https://api.openai.com/v1"
+  temperature: 0.2
+  top_p: 0.9
+  timeout: 300
+  max_new_tokens: 2048
 
-进入交互模式后，可使用以下命令：
+agent:
+  max_steps: 10                  # 每轮请求单个 Agent 的最大工具调用次数
+  approval_policy: "auto"        # ask | auto | never
 
-| 命令 | 说明 |
+multi_agent:
+  max_steps_planner: 10
+  max_steps_coder: 10
+  max_steps_tester: 8
+  max_steps_reviewer: 6
+  max_review_cycles: 5           # Coder↔Reviewer 最大反馈轮数
+
+roles:
+  planner:
+    identity: "You are a Software Architect Planner..."
+  coder:
+    identity: "You are an expert Software Engineer..."
+```
+
+## 🛠 技术栈
+
+| 层级 | 技术 |
 |------|------|
-| `/help` | 显示帮助信息 |
-| `/memory` | 查看智能体的工作记忆 |
-| `/session` | 查看当前会话文件路径 |
-| `/reset` | 清空当前会话历史和记忆 |
-| `/exit` | 退出程序 |
+| 工作流引擎 | [LangGraph](https://github.com/langchain-ai/langgraph) |
+| Web 服务 | [FastAPI](https://fastapi.tiangolo.com/) + WebSocket |
+| 前端 | Vanilla JS + CSS（零构建） |
+| LLM 接入 | Ollama (`/api/generate`) + OpenAI 兼容 API (`/chat/completions`) |
+| 配置管理 | YAML |
+| 测试 | pytest |
 
----
+## 🧪 运行测试
 
-## 七、注意事项
+```bash
+pytest tests/ -q
+```
 
-1. **模型能力**：较小的本地模型（如 4B）可能无法一次生成完全正确的代码，建议增加 `--max-steps` 或更换更强的模型。
-2. **自动审批**：`--approval auto` 会自动批准所有文件写入和命令执行，仅在信任的环境中使用。
-3. **Ollama 超时**：如果模型推理较慢，可通过 `--ollama-timeout` 增加超时时间（默认 300 秒）。
-4. **测试依赖**：运行 pytest 需要环境中已安装 `pytest`，可通过 `uv add --dev pytest` 或 `pip install pytest` 安装。
+## 🤝 致谢
 
----
-
-> **声明**：该项目基于 [mini-coding-agent](https://github.com/rasbt/mini-coding-agent) 做进一步研发。
+本项目受 [mini-coding-agent](https://github.com/rasbt/mini-coding-agent) 启发，在此基础上重构了多智能体编排、实时可观测性与可插拔后端支持。
