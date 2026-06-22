@@ -47,11 +47,6 @@ def build_supervisor_graph(planner: MiniAgent, coder: MiniAgent, tester: MiniAge
     builder = StateGraph(SupervisorState)
     emit = make_emitter(run_id)
 
-    def supervisor_node(state: SupervisorState):
-        emit("supervisor", "node_start")
-        emit("supervisor", "node_end")
-        return {}
-
     def planner_node(state: SupervisorState):
         emit("planner", "node_start")
         plan = planner.ask(state["user_message"])
@@ -156,14 +151,12 @@ def build_supervisor_graph(planner: MiniAgent, coder: MiniAgent, tester: MiniAge
         logger.info("supervisor_decision needs_fix cycle=%d", state["review_cycles"])
         return "needs_fix"
 
-    builder.add_node("supervisor", supervisor_node)
     builder.add_node("planner", planner_node)
     builder.add_node("coder", coder_node)
     builder.add_node("tester", tester_node)
     builder.add_node("reviewer", reviewer_node)
 
-    builder.add_edge(START, "supervisor")
-    builder.add_edge("supervisor", "planner")
+    builder.add_edge(START, "planner")
     builder.add_edge("planner", "coder")
     builder.add_edge("coder", "tester")
     builder.add_edge("tester", "reviewer")
