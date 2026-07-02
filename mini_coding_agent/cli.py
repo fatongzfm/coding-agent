@@ -1,4 +1,5 @@
 import argparse
+import logging
 import os
 import shutil
 import sys
@@ -172,60 +173,47 @@ def build_arg_parser():
     return parser
 
 
-def main(argv=None):
-    args = build_arg_parser().parse_args(argv)
+def _resolve_log_level(args) -> int:
+    """Map CLI flags to a logging level."""
+    if args.verbose:
+        return logging.DEBUG
+    if args.quiet:
+        return logging.WARNING
+    return logging.INFO
 
-    if args.serve:
-        import logging
-        import uvicorn
-        from mini_coding_agent.logging_config import setup_logging
-        from mini_coding_agent.server import app
 
-        log_level = logging.DEBUG if args.verbose else (logging.WARNING if args.quiet else logging.INFO)
-        setup_logging(level=log_level, log_dir=args.log_dir)
-
-        print(f"Starting dashboard server at http://{args.server_host}:{args.server_port}")
-        uvicorn.run(app, host=args.server_host, port=args.server_port)
-        return 0
-
-    # Load config and apply fallback values for api_key / base_url
+def _merge_yaml_config(args) -> None:
+    """Load YAML config and backfill args that were not provided on CLI."""
     from mini_coding_agent.config import load_config
 
     cfg = load_config(args.config)
     model_cfg = cfg.get("model", {})
     multi_cfg = cfg.get("multi_agent", {})
+
     if args.api_key is None:
         args.api_key = model_cfg.get("api_key")
     if args.base_url is None:
         args.base_url = model_cfg.get("base_url", "https://api.openai.com/v1")
+
     args.max_review_cycles = multi_cfg.get("max_review_cycles", 3)
     args.max_steps_planner = multi_cfg.get("max_steps_planner", args.max_steps)
     args.max_steps_coder = multi_cfg.get("max_steps_coder", args.max_steps)
     args.max_steps_tester = multi_cfg.get("max_steps_tester", args.max_steps)
     args.max_steps_reviewer = multi_cfg.get("max_steps_reviewer", args.max_steps)
 
-    import logging
-    from mini_coding_agent.logging_config import setup_logging
 
-    log_level = logging.DEBUG if args.verbose else (logging.WARNING if args.quiet else logging.INFO)
-    setup_logging(level=log_level, log_dir=args.log_dir)
+def _serve_mode(args) -> int:
+    """Start the FastAPI observability dashboard."""
+    import uvicorn
+    from mini_coding_agent.server import app
 
-    agent = build_agent(args)
+    print(f"Starting dashboard server at http://{args.server_host}:{args.server_port}")
+    uvicorn.run(app, host=args.server_host, port=args.server_port)
+    return 0
 
-    backend = f"API:{args.base_url.replace('https://', '').replace('http://', '')}" if args.api_key else f"Ollama:{args.host}"
-    print(build_welcome(agent, model=args.model, backend=backend))
 
-    if args.prompt:
-        prompt = " ".join(args.prompt).strip()
-        if prompt:
-            print()
-            try:
-                print(agent.ask(prompt))
-            except RuntimeError as exc:
-                print(str(exc), file=sys.stderr)
-                return 1
-        return 0
-
+def _interactive_loop(agent) -> int:
+    """Run the read-eval-print loop (REPL)."""
     while True:
         try:
             user_input = input("\nmini-coding-agent> ").strip()
@@ -256,6 +244,46 @@ def main(argv=None):
             print(agent.ask(user_input))
         except RuntimeError as exc:
             print(str(exc), file=sys.stderr)
+
+
+def _cli_mode(args) -> int:
+    """Run in CLI mode: either one-shot or interactive."""
+    _merge_yaml_config(args)
+
+    agent = build_agent(args)
+    backend = (
+        f"API:{args.base_url.replace('https://', '').replace('http://', '')}"
+        if args.api_key
+        else f"Ollama:{args.host}"
+    )
+    print(build_welcome(agent, model=args.model, backend=backend))
+
+    if args.prompt:
+        prompt = " ".join(args.prompt).strip()
+        if not prompt:
+            return 0
+        print()
+        try:
+            print(agent.ask(prompt))
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        return 0
+
+    return _interactive_loop(agent)
+
+
+def main(argv=None) -> int:
+    args = build_arg_parser().parse_args(argv)
+
+    from mini_coding_agent.logging_config import setup_logging
+
+    setup_logging(level=_resolve_log_level(args), log_dir=args.log_dir)
+
+    if args.serve:
+        return _serve_mode(args)
+
+    return _cli_mode(args)
 
 
 if __name__ == "__main__":
