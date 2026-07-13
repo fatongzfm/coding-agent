@@ -1,5 +1,6 @@
 import json
 import pytest
+import httpx
 from unittest.mock import patch
 
 from mini_coding_agent import (
@@ -421,21 +422,11 @@ def test_history_text_deduplicates_unchanged_repeated_reads(tmp_path):
 def test_ollama_client_posts_expected_payload():
     captured = {}
 
-    class FakeResponse:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def read(self):
-            return json.dumps({"response": "<final>ok</final>"}).encode("utf-8")
-
-    def fake_urlopen(request, timeout):
-        captured["url"] = request.full_url
-        captured["timeout"] = timeout
-        captured["body"] = json.loads(request.data.decode("utf-8"))
-        return FakeResponse()
+    def fake_handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["method"] = request.method
+        captured["body"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(200, json={"response": "<final>ok</final>"})
 
     client = OllamaModelClient(
         model="qwen3.5:4b",
@@ -445,12 +436,16 @@ def test_ollama_client_posts_expected_payload():
         timeout=30,
     )
 
-    with patch("urllib.request.urlopen", fake_urlopen):
+    original_client = httpx.Client
+    try:
+        httpx.Client = lambda **kwargs: original_client(transport=httpx.MockTransport(fake_handler), **kwargs)
         result = client.complete("hello", 42)
+    finally:
+        httpx.Client = original_client
 
     assert result == "<final>ok</final>"
     assert captured["url"] == "http://127.0.0.1:11434/api/generate"
-    assert captured["timeout"] == 30
+    assert captured["method"] == "POST"
     assert captured["body"]["model"] == "qwen3.5:4b"
     assert captured["body"]["prompt"] == "hello"
     assert captured["body"]["stream"] is False
@@ -862,24 +857,14 @@ def test_parse_reviewer_verdict_fallback():
 def test_openai_compatible_client_posts_expected_payload():
     captured = {}
 
-    class FakeResponse:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def read(self):
-            return json.dumps({
-                "choices": [{"message": {"content": "<final>ok</final>"}}]
-            }).encode("utf-8")
-
-    def fake_urlopen(request, timeout):
-        captured["url"] = request.full_url
-        captured["timeout"] = timeout
-        captured["body"] = json.loads(request.data.decode("utf-8"))
-        captured["headers"] = dict(request.header_items())
-        return FakeResponse()
+    def fake_handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["method"] = request.method
+        captured["body"] = json.loads(request.content.decode("utf-8"))
+        captured["headers"] = dict(request.headers)
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "<final>ok</final>"}}]
+        })
 
     client = OpenAiCompatibleClient(
         model="gpt-4o-mini",
@@ -890,14 +875,18 @@ def test_openai_compatible_client_posts_expected_payload():
         timeout=30,
     )
 
-    with patch("urllib.request.urlopen", fake_urlopen):
+    original_client = httpx.Client
+    try:
+        httpx.Client = lambda **kwargs: original_client(transport=httpx.MockTransport(fake_handler), **kwargs)
         result = client.complete("hello", 42)
+    finally:
+        httpx.Client = original_client
 
     assert result == "<final>ok</final>"
     assert captured["url"] == "https://api.example.com/v1/chat/completions"
-    assert captured["timeout"] == 30
+    assert captured["method"] == "POST"
     assert captured["body"]["model"] == "gpt-4o-mini"
     assert captured["body"]["messages"] == [{"role": "user", "content": "hello"}]
     assert captured["body"]["max_tokens"] == 42
-    assert captured["headers"]["Authorization"] == "Bearer sk-test123"
-    assert captured["headers"]["Content-type"] == "application/json"
+    assert captured["headers"]["authorization"] == "Bearer sk-test123"
+    assert captured["headers"]["content-type"] == "application/json"

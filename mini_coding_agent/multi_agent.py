@@ -2,12 +2,15 @@ import logging
 import uuid
 from typing import TypedDict
 
+from langgraph.checkpoint.memory import MemorySaver
+
 from mini_coding_agent.agent import MiniAgent
 from mini_coding_agent.context import clip
 from mini_coding_agent.observability import make_emitter
 
 class SupervisorState(TypedDict):
     user_message: str
+    intent: str | None
     plan: str | None
     test_report: str | None
     review_feedback: str | None
@@ -41,11 +44,32 @@ def _parse_reviewer_verdict(raw: str) -> tuple[str, str]:
     return "needs_fix", raw
 
 
-def build_supervisor_graph(planner: MiniAgent, coder: MiniAgent, tester: MiniAgent, reviewer: MiniAgent, run_id: str | None = None, max_review_cycles: int = 3):
+def _classify_intent(user_message: str) -> str:
+    """Lightweight rule-based intent router (no extra LLM call)."""
+    msg = user_message.lower()
+    if any(k in msg for k in ("explain", "what does", "how does", "解释", "说明")):
+        return "explain"
+    if any(k in msg for k in ("fix", "bug", "debug", "修复", "调试", "报错")):
+        return "quick_fix"
+    if any(k in msg for k in ("test", "coverage", "测试", "覆盖率")):
+        return "test_only"
+    if any(k in msg for k in ("review", "check", "评审", "检查")):
+        return "review_only"
+    if any(k in msg for k in ("plan", "design", "架构", "设计", "方案")):
+        return "plan_only"
+    return "full_pipeline"
+
+
+def build_supervisor_graph(planner: MiniAgent, coder: MiniAgent, tester: MiniAgent, reviewer: MiniAgent, run_id: str | None = None, max_review_cycles: int = 3, checkpointer=None):
     from langgraph.graph import StateGraph, START, END
 
     builder = StateGraph(SupervisorState)
     emit = make_emitter(run_id)
+
+    def router_node(state: SupervisorState):
+        intent = _classify_intent(state["user_message"])
+        emit("router", "node_end", {"intent": intent})
+        return {"intent": intent}
 
     def planner_node(state: SupervisorState):
         emit("planner", "node_start")
@@ -77,6 +101,14 @@ def build_supervisor_graph(planner: MiniAgent, coder: MiniAgent, tester: MiniAge
         prompt = "\n\n".join(parts)
         result = coder.ask(prompt)
         emit("coder", "node_end", {"final_answer": result})
+        return {"final_answer": result}
+
+    def explain_node(state: SupervisorState):
+        emit("coder", "node_start", {"mode": "explain"})
+        coder.read_only = True
+        result = coder.ask(f"Explain or answer this concisely:\n{state['user_message']}")
+        coder.read_only = False
+        emit("coder", "node_end", {"mode": "explain", "final_answer": result})
         return {"final_answer": result}
 
     def _is_step_limit_failure(text: str | None) -> bool:
@@ -151,13 +183,37 @@ def build_supervisor_graph(planner: MiniAgent, coder: MiniAgent, tester: MiniAge
         logger.info("supervisor_decision needs_fix cycle=%d", state["review_cycles"])
         return "needs_fix"
 
+    def route_decision(state: SupervisorState) -> str:
+        return state.get("intent") or "full_pipeline"
+
+    def plan_route_decision(state: SupervisorState) -> str:
+        if state.get("intent") == "plan_only":
+            return "plan_only"
+        return "continue"
+
+    builder.add_node("router", router_node)
     builder.add_node("planner", planner_node)
     builder.add_node("coder", coder_node)
     builder.add_node("tester", tester_node)
     builder.add_node("reviewer", reviewer_node)
+    builder.add_node("explain", explain_node)
 
-    builder.add_edge(START, "planner")
-    builder.add_edge("planner", "coder")
+    builder.add_edge(START, "router")
+    builder.add_conditional_edges(
+        "router",
+        route_decision,
+        {
+            "explain": "explain",
+            "plan_only": "planner",
+            "quick_fix": "coder",
+            "full_pipeline": "planner",
+        },
+    )
+    builder.add_conditional_edges(
+        "planner",
+        plan_route_decision,
+        {"plan_only": END, "continue": "coder"},
+    )
     builder.add_edge("coder", "tester")
     builder.add_edge("tester", "reviewer")
     builder.add_conditional_edges(
@@ -165,8 +221,9 @@ def build_supervisor_graph(planner: MiniAgent, coder: MiniAgent, tester: MiniAge
         supervisor_decision,
         {"approved": END, "max_cycles": END, "needs_fix": "coder"},
     )
+    builder.add_edge("explain", END)
 
-    return builder.compile()
+    return builder.compile(checkpointer=checkpointer)
 
 
 class MultiAgentRunner:
@@ -223,9 +280,11 @@ class MultiAgentRunner:
             role="reviewer",
         )
         self.max_review_cycles = max_review_cycles
+        self.checkpointer = MemorySaver()
         self.graph = build_supervisor_graph(
             self.planner, self.coder, self.tester, self.reviewer,
             max_review_cycles=max_review_cycles,
+            checkpointer=self.checkpointer,
         )
         self.workspace = workspace
         self.approval_policy = approval_policy
@@ -252,7 +311,7 @@ class MultiAgentRunner:
         self.reviewer.reset()
 
     def ask(self, user_message):
-        from mini_coding_agent.observability import WorkflowEvent, event_bus
+        from mini_coding_agent.observability import WorkflowEvent, event_bus, metrics_collector
 
         run_id = uuid.uuid4().hex[:12]
         self.planner.run_id = run_id
@@ -263,10 +322,12 @@ class MultiAgentRunner:
             self.planner, self.coder, self.tester, self.reviewer, run_id=run_id
         )
 
+        metrics_collector.start_run(run_id, user_message)
         event_bus.publish(WorkflowEvent.now(run_id, "system", "run_start", {"user_message": user_message}))
 
         initial_state = {
             "user_message": user_message,
+            "intent": None,
             "plan": None,
             "test_report": None,
             "review_feedback": None,
@@ -276,6 +337,7 @@ class MultiAgentRunner:
         }
         final_state = self.graph.invoke(initial_state)  # type: ignore
 
+        metrics_collector.end_run(run_id)
         verdict = final_state.get("review_verdict", "unknown")
         status = "approved" if verdict == "approved" else "max_cycles"
         event_bus.publish(

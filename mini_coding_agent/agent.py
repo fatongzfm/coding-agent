@@ -19,7 +19,11 @@ from mini_coding_agent.context import (
     MAX_HISTORY,
     MAX_TOOL_OUTPUT,
 )
-from mini_coding_agent.observability import make_emitter
+from mini_coding_agent.observability import make_emitter, metrics_collector
+from mini_coding_agent.skills.base import SkillRegistry
+
+# Ensure built-in skills are registered at import time
+SkillRegistry.discover_builtin()
 
 class AgentState(TypedDict):
     tool_steps: int
@@ -56,7 +60,15 @@ def _make_call_model_node(agent):
         prompt = agent.prompt(state["user_message"])
         logger.debug("model_call role=%s prompt_chars=%d max_tokens=%d", agent.role, len(prompt), agent.max_new_tokens)
         agent.emit(agent.role, "llm_call", {"prompt_chars": len(prompt), "max_tokens": agent.max_new_tokens})
+        t0 = time.perf_counter()
         raw = agent.model_client.complete(prompt, agent.max_new_tokens)
+        latency_ms = (time.perf_counter() - t0) * 1000
+        metrics_collector.record_llm_call(
+            agent.run_id or agent.session["id"],
+            latency_ms,
+            len(prompt),
+            len(raw),
+        )
         logger.debug("model_response role=%s response_chars=%d", agent.role, len(raw))
         agent.emit(agent.role, "llm_output", {"raw": raw, "response_chars": len(raw)})
         return {"raw_output": raw, "attempts": state["attempts"] + 1}
@@ -80,6 +92,10 @@ def _make_handle_tool_node(agent):
         t0 = time.perf_counter()
         result = agent.run_tool(name, args)
         duration_ms = int((time.perf_counter() - t0) * 1000)
+        metrics_collector.record_tool_call(
+            agent.run_id or agent.session["id"],
+            duration_ms,
+        )
         logger.info(
             "tool_execution tool=%s duration_ms=%d result_chars=%d",
             name, duration_ms, len(result),
@@ -240,6 +256,29 @@ class MiniAgent:
     #### 3) Structured Tools And Permissions ######
     ###############################################
     def build_tools(self):
+        # Build tools from the skill registry with role-based filtering
+        skills = SkillRegistry.list_skills()
+        tools = {}
+        for name, skill in skills.items():
+            # Filter write/patch permissions based on role and read_only mode
+            if name in ("write_file", "patch_file"):
+                if self.read_only or (self.role == "tester" and self.read_only):
+                    continue
+                if self.role not in ("coder", "tester"):
+                    continue
+            # Filter delegate based on depth
+            if name == "delegate" and self.depth >= self.max_depth:
+                continue
+            tools[name] = {
+                "schema": skill.get_schema_dict(),
+                "risky": skill.risky,
+                "description": skill.description,
+                "run": lambda args, s=skill: s.validate_and_run(self, args),
+            }
+        return tools
+
+    def build_tools_legacy(self):
+        """Legacy hard-coded tool builder (kept for reference / fallback)."""
         tools = {
             "list_files": {
                 "schema": {"path": "str='.'"},
@@ -298,7 +337,21 @@ class MiniAgent:
         for name, tool in self.tools.items():
             if is_read_only and name in ("write_file", "patch_file"):
                 continue
-            fields = ", ".join(f"{key}: {value}" for key, value in tool["schema"].items())
+            schema = tool["schema"]
+            # Handle both legacy string dicts and new Pydantic JSON Schema
+            if isinstance(schema, dict) and "properties" in schema:
+                field_parts = []
+                for key, prop in schema.get("properties", {}).items():
+                    ptype = prop.get("type", "any")
+                    if "default" in prop:
+                        field_parts.append(f"{key}: {ptype}={prop['default']}")
+                    elif key not in schema.get("required", []):
+                        field_parts.append(f"{key}: {ptype} (optional)")
+                    else:
+                        field_parts.append(f"{key}: {ptype}")
+                fields = ", ".join(field_parts)
+            else:
+                fields = ", ".join(f"{key}: {value}" for key, value in schema.items())
             risk = "approval required" if tool["risky"] else "safe"
             tool_lines.append(f"- {name}({fields}) [{risk}] {tool['description']}")
         tool_text = "\n".join(tool_lines)
@@ -659,6 +712,24 @@ class MiniAgent:
     def validate_tool(self, name, args):
         args = args or {}
 
+        # Phase 1: Pydantic schema validation (if skill is registered)
+        skill = SkillRegistry.get(name)
+        if skill is not None and skill.param_model is not None:
+            from pydantic import ValidationError
+
+            try:
+                validated = skill.param_model.model_validate(args)
+                # Merge validated defaults back into args for legacy checks below
+                args = validated.model_dump()
+            except ValidationError as exc:
+                # Produce a concise single-field error message for backward compat
+                first_error = exc.errors()[0]
+                field = first_error.get("loc", [""])[0] if first_error.get("loc") else ""
+                raise ValueError(f"'{field}'") from exc
+            except Exception as exc:
+                raise ValueError(str(exc)) from exc
+
+        # Phase 2: Legacy runtime / filesystem validation (kept for backward compat)
         if name == "list_files":
             path = self.path(args.get("path", "."))
             if not path.is_dir():

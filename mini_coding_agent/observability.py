@@ -3,6 +3,7 @@
 import json
 import logging
 import uuid
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,6 +40,97 @@ class WorkflowEvent:
             "event_type": self.event_type,
             "payload": self.payload,
         }
+
+
+class MetricsCollector:
+    """In-memory metrics collector for agent performance observability."""
+
+    def __init__(self):
+        self._runs: dict[str, dict] = {}
+
+    def start_run(self, run_id: str, user_message: str = "") -> None:
+        self._runs[run_id] = {
+            "run_id": run_id,
+            "start_time": time.perf_counter(),
+            "user_message": user_message,
+            "llm_calls": 0,
+            "llm_latency_ms": 0.0,
+            "tool_calls": 0,
+            "tool_latency_ms": 0.0,
+            "total_tokens": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "steps": 0,
+            "review_cycles": 0,
+            "nodes": {},
+        }
+
+    def record_llm_call(self, run_id: str, latency_ms: float, prompt_chars: int, response_chars: int) -> None:
+        run = self._runs.get(run_id)
+        if run is None:
+            return
+        run["llm_calls"] += 1
+        run["llm_latency_ms"] += latency_ms
+        run["prompt_tokens"] += prompt_chars // 4  # rough estimate
+        run["completion_tokens"] += response_chars // 4
+        run["total_tokens"] += (prompt_chars + response_chars) // 4
+
+    def record_tool_call(self, run_id: str, latency_ms: float) -> None:
+        run = self._runs.get(run_id)
+        if run is None:
+            return
+        run["tool_calls"] += 1
+        run["tool_latency_ms"] += latency_ms
+        run["steps"] += 1
+
+    def record_node(self, run_id: str, node: str, latency_ms: float) -> None:
+        run = self._runs.get(run_id)
+        if run is None:
+            return
+        if node not in run["nodes"]:
+            run["nodes"][node] = {"count": 0, "latency_ms": 0.0}
+        run["nodes"][node]["count"] += 1
+        run["nodes"][node]["latency_ms"] += latency_ms
+
+    def record_review_cycle(self, run_id: str) -> None:
+        run = self._runs.get(run_id)
+        if run is None:
+            return
+        run["review_cycles"] += 1
+
+    def end_run(self, run_id: str) -> dict:
+        run = self._runs.get(run_id)
+        if run is None:
+            return {}
+        elapsed_ms = (time.perf_counter() - run["start_time"]) * 1000
+        run["total_latency_ms"] = elapsed_ms
+        return self.get_run_metrics(run_id)
+
+    def get_run_metrics(self, run_id: str) -> dict:
+        run = self._runs.get(run_id)
+        if run is None:
+            return {}
+        return {
+            "run_id": run["run_id"],
+            "user_message": run["user_message"],
+            "total_latency_ms": round(run.get("total_latency_ms", 0), 2),
+            "llm_calls": run["llm_calls"],
+            "llm_latency_ms": round(run["llm_latency_ms"], 2),
+            "tool_calls": run["tool_calls"],
+            "tool_latency_ms": round(run["tool_latency_ms"], 2),
+            "total_tokens": run["total_tokens"],
+            "prompt_tokens": run["prompt_tokens"],
+            "completion_tokens": run["completion_tokens"],
+            "steps": run["steps"],
+            "review_cycles": run["review_cycles"],
+            "nodes": run["nodes"],
+        }
+
+    def get_all_metrics(self) -> list[dict]:
+        return [self.get_run_metrics(rid) for rid in self._runs]
+
+    def clear(self) -> None:
+        self._runs.clear()
 
 
 class EventBus:
@@ -145,6 +237,7 @@ class EventBus:
 
 # Global singleton – imported by server and multi_agent.
 event_bus = EventBus()
+metrics_collector = MetricsCollector()
 
 
 def make_emitter(run_id: str | None):

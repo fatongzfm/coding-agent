@@ -16,7 +16,7 @@ from mini_coding_agent.config import load_config
 from mini_coding_agent.context import SessionStore, WorkspaceContext
 from mini_coding_agent.models import OllamaModelClient, OpenAiCompatibleClient
 from mini_coding_agent.multi_agent import MultiAgentRunner
-from mini_coding_agent.observability import WorkflowEvent, event_bus
+from mini_coding_agent.observability import WorkflowEvent, event_bus, metrics_collector
 
 logger = logging.getLogger("mca.server")
 
@@ -33,7 +33,7 @@ _executor = ThreadPoolExecutor(max_workers=2)
 
 class RunRequest(BaseModel):
     user_message: str
-    model: str = "gpt-4o-mini"
+    model: str | None = None
     host: str = "http://127.0.0.1:11434"
     api_key: str | None = None
     base_url: str | None = None
@@ -53,6 +53,15 @@ def _build_runner(req: RunRequest):
     cfg = load_config(None)
     model_cfg = cfg.get("model", {})
     multi_cfg = cfg.get("multi_agent", {})
+
+    # Backfill request fields from config (config takes precedence over defaults)
+    if req.api_key is None:
+        req.api_key = model_cfg.get("api_key")
+    if req.base_url is None:
+        req.base_url = model_cfg.get("base_url", "https://api.openai.com/v1")
+    if req.model is None:
+        req.model = model_cfg.get("name", "gpt-4o-mini")
+
     temperature = model_cfg.get("temperature", 0.2)
     top_p = model_cfg.get("top_p", 0.9)
     timeout = model_cfg.get("timeout", 300)
@@ -84,7 +93,7 @@ def _build_runner(req: RunRequest):
         max_steps_tester=multi_cfg.get("max_steps_tester", req.max_steps),
         max_steps_reviewer=multi_cfg.get("max_steps_reviewer", req.max_steps),
         max_new_tokens=req.max_new_tokens,
-        max_review_cycles=multi_cfg.get("max_review_cycles", 3),
+        max_review_cycles=max_review_cycles,
     )
 
 
@@ -95,16 +104,6 @@ async def api_run(req: RunRequest):
     if _main_loop is None:
         _main_loop = asyncio.get_running_loop()
     loop = asyncio.get_running_loop()
-
-    cfg = load_config(None)
-    model_cfg = cfg.get("model", {})
-    multi_cfg = cfg.get("multi_agent", {})
-    if req.api_key is None:
-        req.api_key = model_cfg.get("api_key")
-    if req.base_url is None:
-        req.base_url = model_cfg.get("base_url", "https://api.openai.com/v1")
-    if req.model == "gpt-4o-mini" and "name" in model_cfg:
-        req.model = model_cfg["name"]
 
     def _run():
         try:
@@ -178,6 +177,18 @@ def api_logs(run_id: str):
     """Return persisted events for a given run."""
     events = event_bus.get_history(run_id)
     return {"run_id": run_id, "events": [ev.to_dict() for ev in events]}
+
+
+@app.get("/api/metrics")
+def api_metrics():
+    """Return aggregated metrics for all runs."""
+    return {"runs": metrics_collector.get_all_metrics()}
+
+
+@app.get("/api/metrics/{run_id}")
+def api_run_metrics(run_id: str):
+    """Return metrics for a specific run."""
+    return {"run_id": run_id, "metrics": metrics_collector.get_run_metrics(run_id)}
 
 
 @app.get("/")
